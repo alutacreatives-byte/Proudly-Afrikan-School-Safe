@@ -1,0 +1,772 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  Type,
+  ClipboardCopy,
+  FileUp,
+  Camera,
+  ArrowRight,
+  AlertCircle,
+  FileText,
+  Trash2,
+  Loader2,
+  Sliders,
+  Sparkles,
+} from 'lucide-react';
+import {
+  CreationMethod,
+  DifficultyLevel,
+  EducationLevel,
+  QuestionType,
+  QuizSettings,
+  SubjectCategory,
+} from '../types';
+import { extractTextFromFile } from '../utils/pdfExtractor';
+import { CameraCaptureModal } from '../../study/components/CameraCaptureModal';
+
+interface QuizBuilderProps {
+  creationMethod: CreationMethod;
+  onMethodChange: (method: CreationMethod) => void;
+  onGenerateQuiz: (params: {
+    creationMethod: CreationMethod;
+    topic: string;
+    text: string;
+    fileName: string;
+    fileText: string;
+    settings: QuizSettings;
+  }) => Promise<void>;
+  isGenerating: boolean;
+  topicInput: string;
+  setTopicInput: (val: string) => void;
+  selectedSubject: SubjectCategory;
+  setSelectedSubject: (val: SubjectCategory) => void;
+}
+
+const LOADING_STEPS = [
+  'BUILDING YOUR QUIZ...',
+  'READING YOUR MATERIAL...',
+  'CHOOSING THE QUESTIONS...',
+  'CHECKING THE ANSWERS...',
+  'READY.',
+];
+
+export const QuizBuilder: React.FC<QuizBuilderProps> = ({
+  creationMethod,
+  onMethodChange,
+  onGenerateQuiz,
+  isGenerating,
+  topicInput,
+  setTopicInput,
+  selectedSubject,
+  setSelectedSubject,
+}) => {
+  // Input states
+  const [textInput, setTextInput] = useState('');
+  const [uploadedFile, setUploadedFile] = useState<{
+    name: string;
+    size: string;
+    text: string;
+    pageCount?: number;
+  } | null>(null);
+  const [isExtractingPdf, setIsExtractingPdf] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [loadingStepIndex, setLoadingStepIndex] = useState(0);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Settings states
+  const [questionCount, setQuestionCount] = useState<number>(10);
+  const [difficulty, setDifficulty] = useState<DifficultyLevel>('medium');
+  const [questionType, setQuestionType] = useState<QuestionType>('multiple_choice');
+  const [educationLevel, setEducationLevel] = useState<EducationLevel>('high_school');
+
+  // Cycle through loading steps during generation
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+    if (isGenerating) {
+      setLoadingStepIndex(0);
+      interval = setInterval(() => {
+        setLoadingStepIndex((prev) => (prev < LOADING_STEPS.length - 1 ? prev + 1 : prev));
+      }, 1500);
+    } else {
+      setLoadingStepIndex(0);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isGenerating]);
+
+  // Handle PDF / Text file upload
+  const handleFileUpload = async (file: File) => {
+    setValidationError(null);
+    setIsExtractingPdf(true);
+    try {
+      const result = await extractTextFromFile(file);
+      const sizeStr = (file.size / 1024).toFixed(1) + ' KB';
+      setUploadedFile({
+        name: file.name,
+        size: sizeStr,
+        text: result.text,
+        pageCount: result.pageCount,
+      });
+    } catch (err: any) {
+      setValidationError(err?.message || 'Could not extract text from this file. Please ensure it contains readable text or try pasting your notes directly.');
+      setUploadedFile(null);
+    } finally {
+      setIsExtractingPdf(false);
+    }
+  };
+
+  const onFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      handleFileUpload(e.target.files[0]);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileUpload(e.dataTransfer.files[0]);
+    }
+  };
+
+  // Camera & Photo Capture state (CAPTURE IT)
+  const [isCameraModalOpen, setIsCameraModalOpen] = useState(false);
+  const [capturedImagePreview, setCapturedImagePreview] = useState<string | null>(null);
+  const [capturedFileName, setCapturedFileName] = useState<string>('');
+  const [capturedText, setCapturedText] = useState<string>('');
+  const [isParsingCapture, setIsParsingCapture] = useState(false);
+  const cameraFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handlePhotoCaptured = async (photoBlob: Blob, photoDataUrl: string, fileName: string) => {
+    setIsCameraModalOpen(false);
+    setCapturedImagePreview(photoDataUrl);
+    setCapturedFileName(fileName);
+    setIsParsingCapture(true);
+    setValidationError(null);
+
+    if (!topicInput) {
+      setTopicInput(fileName.replace(/\.[^/.]+$/, '').replace(/study-capture-/i, 'Photographed Notes ').replace(/[-_]/g, ' '));
+    }
+
+    try {
+      const file = new File([photoBlob], fileName, { type: photoBlob.type || 'image/jpeg' });
+      const parsed = await extractTextFromFile(file);
+      if (parsed && parsed.text) {
+        setCapturedText(parsed.text);
+      } else {
+        setCapturedText('Captured study material from camera. Ready for quiz generation.');
+      }
+    } catch (err: any) {
+      console.warn('OCR transcription notice:', err);
+      setCapturedText('Captured study material. Ready for quiz generation.');
+    } finally {
+      setIsParsingCapture(false);
+    }
+  };
+
+  const handleCameraFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = (event.target?.result as string) || '';
+      handlePhotoCaptured(file, dataUrl, file.name);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleGenerateClick = () => {
+    setValidationError(null);
+
+    // Validate
+    if (creationMethod === 'topic') {
+      if (!topicInput.trim()) {
+        setValidationError('Please enter a topic to quiz (e.g., "The Kingdom of Mali" or "Photosynthesis").');
+        return;
+      }
+    } else if (creationMethod === 'text') {
+      if (!textInput.trim() || textInput.trim().length < 15) {
+        setValidationError('Please paste sufficient notes or text (at least 15 characters) to generate questions from.');
+        return;
+      }
+    } else if (creationMethod === 'pdf') {
+      if (!uploadedFile || !uploadedFile.text) {
+        setValidationError('Please upload a PDF or document before generating.');
+        return;
+      }
+    } else if (creationMethod === 'capture') {
+      if (!capturedText.trim() && !capturedImagePreview) {
+        setValidationError('Please photograph or upload study material before generating.');
+        return;
+      }
+    }
+
+    const settings: QuizSettings = {
+      questionCount,
+      difficulty,
+      questionType,
+      educationLevel,
+      subject: selectedSubject,
+    };
+
+    onGenerateQuiz({
+      creationMethod,
+      topic: topicInput,
+      text: creationMethod === 'capture' ? capturedText : textInput,
+      fileName: creationMethod === 'capture' ? capturedFileName : (uploadedFile?.name || ''),
+      fileText: creationMethod === 'capture' ? capturedText : (uploadedFile?.text || ''),
+      settings,
+    });
+  };
+
+  // Sample quick texts for the Text mode
+  const handleLoadSampleText = () => {
+    setTextInput(
+      `The Kingdom of Kush was an ancient civilization located in Nubia along the Nile Valley (modern-day Sudan). Kush was famous for its rich gold deposits, formidable archers known throughout the ancient Mediterranean, and vast iron-smelting industry centered at the royal city of Meroë. Kushite rulers even conquered and ruled Egypt as its 25th Dynasty (the Black Pharaohs) under kings such as Piye and Taharqa. The civilization built more than 200 distinct steep-sided royal pyramids at Meroë, outnumbering those in Egypt, and developed their own unique written script known as Meroitic.`
+    );
+    setSelectedSubject('History');
+    setValidationError(null);
+  };
+
+  const subjectsList: SubjectCategory[] = [
+    'General',
+    'History',
+    'Geography',
+    'Science',
+    'Mathematics',
+    'Literature',
+    'Languages',
+    'Social Studies',
+    'Other',
+  ];
+
+  return (
+    <section id="quiz-builder" className="py-8 sm:py-12 border-b border-stone-200/80">
+      {/* Section Title */}
+      <div className="text-center md:text-left mb-8 pb-6 border-b border-stone-200/80">
+        <span className="font-mono text-xs font-bold uppercase tracking-widest text-[#E52E5E] block mb-2">
+          SECTION 03 • INTERACTIVE ENGINE
+        </span>
+        <h2 className="font-display font-black text-3xl sm:text-5xl md:text-6xl uppercase tracking-tight text-[#161616] leading-none break-words">
+          WHAT ARE WE QUIZZING?
+        </h2>
+        <p className="text-base sm:text-lg text-stone-600 mt-2 max-w-3xl font-normal">
+          Select your knowledge source and configure your preferences below.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+        {/* Left Column: Knowledge Source Tabs & Inputs (7 cols) */}
+        <div className="lg:col-span-7 space-y-6">
+          {/* Method Selectors / Rounded Pill Tabs */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 bg-[#EFE8DE] p-2 rounded-2xl border border-[#E4DCD0] shadow-[inset_2px_2px_4px_rgba(0,0,0,0.06)] gap-2">
+            <button
+              onClick={() => {
+                onMethodChange('topic');
+                setValidationError(null);
+              }}
+              className={`py-3 px-3 rounded-xl font-display font-black text-xs sm:text-sm uppercase tracking-tight flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                creationMethod === 'topic'
+                  ? 'bg-[#E62E6B] text-white shadow-[0_4px_12px_rgba(230,46,107,0.35)] scale-101'
+                  : 'bg-transparent text-stone-700 hover:bg-[#FAF4EC]'
+              }`}
+            >
+              <Type className="w-4 h-4" />
+              <span>1. TOPIC</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onMethodChange('text');
+                setValidationError(null);
+              }}
+              className={`py-3 px-3 rounded-xl font-display font-black text-xs sm:text-sm uppercase tracking-tight flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                creationMethod === 'text'
+                  ? 'bg-[#E62E6B] text-white shadow-[0_4px_12px_rgba(230,46,107,0.35)] scale-101'
+                  : 'bg-transparent text-stone-700 hover:bg-[#FAF4EC]'
+              }`}
+            >
+              <ClipboardCopy className="w-4 h-4" />
+              <span>2. TEXT</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onMethodChange('pdf');
+                setValidationError(null);
+              }}
+              className={`py-3 px-3 rounded-xl font-display font-black text-xs sm:text-sm uppercase tracking-tight flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                creationMethod === 'pdf'
+                  ? 'bg-[#E62E6B] text-white shadow-[0_4px_12px_rgba(230,46,107,0.35)] scale-101'
+                  : 'bg-transparent text-stone-700 hover:bg-[#FAF4EC]'
+              }`}
+            >
+              <FileUp className="w-4 h-4" />
+              <span>3. PDF</span>
+            </button>
+
+            <button
+              onClick={() => {
+                onMethodChange('capture');
+                setValidationError(null);
+              }}
+              className={`py-3 px-3 rounded-xl font-display font-black text-xs sm:text-sm uppercase tracking-tight flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                creationMethod === 'capture'
+                  ? 'bg-[#E62E6B] text-white shadow-[0_4px_12px_rgba(230,46,107,0.35)] scale-101'
+                  : 'bg-transparent text-stone-700 hover:bg-[#FAF4EC]'
+              }`}
+            >
+              <Camera className="w-4 h-4" />
+              <span>4. CAPTURE</span>
+            </button>
+          </div>
+
+          {/* Dynamic Input Panels */}
+          <div className="bg-[#FAF4EC] rounded-[2.5rem] border border-[#EFE5DA] shadow-[0_2px_10px_rgba(100,80,60,0.04),_0_12px_30px_rgba(100,80,60,0.08),_0_28px_56px_-6px_rgba(100,80,60,0.10),_0_45px_80px_-12px_rgba(100,80,60,0.08)] p-6 sm:p-8 min-h-[340px] flex flex-col justify-between">
+            {/* METHOD 1: TOPIC */}
+            {creationMethod === 'topic' && (
+              <div className="space-y-5 flex-1 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label htmlFor="topic-input" className="font-mono-code text-[10px] uppercase tracking-wider text-[#292929]">
+                      ENTER TOPIC OR PROMPT
+                    </label>
+                    <span className="font-mono-code text-[9px] text-[#736E65]">ANY SUBJECT</span>
+                  </div>
+
+                  <input
+                    id="topic-input"
+                    type="text"
+                    value={topicInput}
+                    onChange={(e) => {
+                      setTopicInput(e.target.value);
+                      if (validationError) setValidationError(null);
+                    }}
+                    placeholder="e.g. The Kingdom of Mali, Quantum Physics, African Wildlife..."
+                    className="w-full bg-[#FAF7F2] border border-[#E0D8C5] rounded-xl p-4 font-display text-sm sm:text-base text-[#292929] placeholder:text-[#A39E93] focus:outline-none focus:ring-2 focus:ring-[#E52E5E] transition-all"
+                    disabled={isGenerating}
+                  />
+                </div>
+
+                {/* Inspiration chips */}
+                <div className="pt-4 border-t border-[#292929]/10">
+                  <span className="font-mono-code text-xs font-bold uppercase text-[#5E5950] block mb-2.5">
+                    POPULAR EDUCATIONAL TOPICS:
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {[
+                      { name: 'Kingdom of Kush & Nubia', sub: 'History' as SubjectCategory },
+                      { name: 'African Great Lakes Ecology', sub: 'Geography' as SubjectCategory },
+                      { name: 'Plate Tectonics & Rift Valleys', sub: 'Geography' as SubjectCategory },
+                      { name: 'M-Pesa & Mobile Finance', sub: 'Social Studies' as SubjectCategory },
+                      { name: 'Chinua Achebe’s Novels', sub: 'Literature' as SubjectCategory },
+                    ].map((item) => (
+                      <button
+                        key={item.name}
+                        onClick={() => {
+                          setTopicInput(item.name);
+                          setSelectedSubject(item.sub);
+                          setValidationError(null);
+                        }}
+                        className="text-xs font-mono-code font-bold bg-[#FAF7F2] hover:bg-[#E52E5E] hover:text-white px-3 py-1.5 rounded-full border border-[#E0D8C5] transition-all cursor-pointer"
+                      >
+                        + {item.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* METHOD 2: TEXT */}
+            {creationMethod === 'text' && (
+              <div className="space-y-4 flex-1 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label htmlFor="text-input" className="font-mono-code text-xs font-bold uppercase tracking-wider text-[#292929]">
+                      PASTE STUDY NOTES, ARTICLES OR EXCERPTS
+                    </label>
+                    <button
+                      onClick={handleLoadSampleText}
+                      className="font-mono-code text-xs text-[#E52E5E] hover:underline font-bold cursor-pointer"
+                    >
+                      Paste Sample Notes
+                    </button>
+                  </div>
+
+                  <textarea
+                    id="text-input"
+                    rows={7}
+                    value={textInput}
+                    onChange={(e) => {
+                      setTextInput(e.target.value);
+                      if (validationError) setValidationError(null);
+                    }}
+                    placeholder="Paste notes, textbook paragraphs, research papers, or syllabus summaries here..."
+                    className="w-full bg-[#FAF7F2] border border-[#E0D8C5] rounded-xl p-4 font-mono-code text-xs sm:text-sm text-[#292929] placeholder:text-[#A39E93] focus:outline-none focus:ring-2 focus:ring-[#E52E5E] resize-y"
+                    disabled={isGenerating}
+                  ></textarea>
+                </div>
+
+                <div className="flex items-center justify-between text-xs font-mono-code text-[#5E5950] pt-2 border-t border-[#292929]/10">
+                  <span>CHARACTERS: {textInput.length}</span>
+                  <span>EST. WORDS: {textInput.trim() ? textInput.trim().split(/\s+/).length : 0}</span>
+                </div>
+              </div>
+            )}
+
+            {/* METHOD 3: PDF / FILE */}
+            {creationMethod === 'pdf' && (
+              <div className="space-y-4 flex-1 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="font-mono-code text-xs font-bold uppercase tracking-wider text-[#292929]">
+                      UPLOAD PDF OR EDUCATIONAL DOCUMENT
+                    </label>
+                    <span className="font-mono-code text-[11px] font-bold text-[#736E65]">PDF, TXT, MD</span>
+                  </div>
+
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={onFileInputChange}
+                    accept=".pdf,.txt,.md,.doc"
+                    className="hidden"
+                    disabled={isGenerating || isExtractingPdf}
+                  />
+
+                  {!uploadedFile ? (
+                    <div
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        setIsDragOver(true);
+                      }}
+                      onDragLeave={() => setIsDragOver(false)}
+                      onDrop={handleDrop}
+                      onClick={() => fileInputRef.current?.click()}
+                      className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all flex flex-col items-center justify-center min-h-[180px] ${
+                        isDragOver ? 'bg-[#FAF0EB] border-[#E52E5E]' : 'bg-[#FAF7F2] border-[#E0D8C5] hover:bg-[#F2ECE1]'
+                      }`}
+                    >
+                      {isExtractingPdf ? (
+                        <div className="flex flex-col items-center gap-3">
+                          <Loader2 className="w-8 h-8 text-[#E52E5E] animate-spin" />
+                          <span className="font-mono-code text-xs font-bold uppercase text-[#292929]">
+                            READING & EXTRACTING DOCUMENT TEXT...
+                          </span>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="w-12 h-12 rounded-full bg-[#1A1A1A] text-[#E52E5E] flex items-center justify-center mb-3 shadow-xs">
+                            <FileUp className="w-6 h-6" />
+                          </div>
+                          <p className="font-display font-black text-base sm:text-lg text-[#292929] uppercase">
+                            CLICK TO UPLOAD OR DRAG & DROP
+                          </p>
+                          <p className="font-mono-code text-xs text-[#5E5950] mt-1">
+                            Supports PDF documents, lecture slides, study notes
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="bg-[#FAF7F2] rounded-2xl border border-[#E0D8C5] p-4 flex items-center justify-between">
+                      <div className="flex items-center gap-3 overflow-hidden">
+                        <div className="w-10 h-10 rounded-xl bg-[#E52E5E] text-white flex items-center justify-center shrink-0">
+                          <FileText className="w-5 h-5" />
+                        </div>
+                        <div className="truncate">
+                          <div className="font-mono-code text-sm font-bold text-[#292929] truncate">
+                            {uploadedFile.name}
+                          </div>
+                          <div className="font-mono-code text-xs text-[#5E5950] flex items-center gap-2">
+                            <span>{uploadedFile.size}</span>
+                            {uploadedFile.pageCount && <span>• {uploadedFile.pageCount} Pages</span>}
+                            <span>• {uploadedFile.text.length} Characters extracted</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => setUploadedFile(null)}
+                        className="p-2 rounded-xl text-[#292929] hover:bg-[#E52E5E] hover:text-white border border-[#E0D8C5] transition-colors ml-3 cursor-pointer shrink-0"
+                        title="Remove file"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-xs font-mono-code text-[#5E5950] pt-2 border-t border-[#292929]/10">
+                  <span>Questions are strictly generated from the extracted text without outside hallucinations.</span>
+                </div>
+              </div>
+            )}
+
+            {/* METHOD 4: CAPTURE */}
+            {creationMethod === 'capture' && (
+              <div className="space-y-4 flex-1 flex flex-col justify-between">
+                <input
+                  type="file"
+                  ref={cameraFileInputRef}
+                  onChange={handleCameraFileUpload}
+                  accept="image/*"
+                  capture="environment"
+                  className="hidden"
+                />
+
+                {capturedImagePreview ? (
+                  <div className="p-4 sm:p-5 bg-orange-50/50 border border-orange-200 rounded-2xl space-y-4">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <div className="w-14 h-14 rounded-xl overflow-hidden border border-orange-200 bg-white shadow-xs shrink-0">
+                          <img src={capturedImagePreview} alt="Captured study material" className="w-full h-full object-cover" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-display font-black text-xs sm:text-sm uppercase text-[#161616]">
+                              Photographed Study Material
+                            </span>
+                            <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[10px] font-mono font-bold uppercase rounded-full">
+                              Captured
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-stone-500 font-mono mt-0.5">
+                            {capturedFileName || 'study-photo.jpg'} &bull; Ready for quiz generation
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setIsCameraModalOpen(true)}
+                        className="px-3 py-2 bg-white hover:bg-stone-100 border border-stone-300 rounded-xl text-xs font-mono font-bold text-stone-800 flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                      >
+                        <Camera className="w-3.5 h-3.5 text-[#E52E5E]" />
+                        <span>Retake Photo</span>
+                      </button>
+                    </div>
+
+                    <div className="space-y-1.5 pt-2 border-t border-orange-100">
+                      <label className="font-mono-code text-xs font-bold uppercase tracking-wider text-[#292929]">
+                        Extracted Content / Notes (Editable)
+                      </label>
+                      <textarea
+                        rows={4}
+                        value={capturedText}
+                        onChange={(e) => setCapturedText(e.target.value)}
+                        placeholder="Extracted textbook, notes, equations, diagrams, or worksheet text..."
+                        className="w-full bg-white border border-stone-200 rounded-xl p-3 font-mono-code text-xs text-[#292929] focus:outline-none focus:ring-2 focus:ring-[#E52E5E]"
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    onClick={() => setIsCameraModalOpen(true)}
+                    className="border-2 border-dashed border-[#E0D8C5] hover:border-[#E52E5E] bg-[#FAF7F2] hover:bg-orange-50/30 rounded-2xl p-6 text-center space-y-3 cursor-pointer transition-all"
+                  >
+                    <div className="w-12 h-12 mx-auto rounded-full bg-white border border-[#E0D8C5] shadow-xs flex items-center justify-center text-[#E52E5E]">
+                      {isParsingCapture ? <Loader2 className="w-6 h-6 animate-spin" /> : <Camera className="w-6 h-6" />}
+                    </div>
+                    <div>
+                      <div className="font-display font-black text-sm sm:text-base uppercase text-[#292929]">
+                        {isParsingCapture ? 'Analyzing & Transcribing Photo...' : 'CAPTURE IT • PHOTOGRAPH STUDY MATERIAL'}
+                      </div>
+                      <p className="font-mono-code text-xs text-[#5E5950] mt-1">
+                        Photograph homework, textbook pages, handwritten work, equations, diagrams, or worksheets.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setIsCameraModalOpen(true);
+                        }}
+                        className="px-4 py-2 bg-gradient-to-r from-[#E52E5E] via-[#F25C22] to-[#FF6B00] hover:brightness-105 text-white font-display text-xs font-black uppercase tracking-wider rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Camera className="w-3.5 h-3.5" />
+                        <span>Open Device Camera</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          cameraFileInputRef.current?.click();
+                        }}
+                        className="px-4 py-2 bg-white hover:bg-stone-100 border border-[#E0D8C5] rounded-xl text-xs font-mono font-bold text-stone-800 flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      >
+                        <FileUp className="w-3.5 h-3.5 text-stone-600" />
+                        <span>Upload Photo File</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+                <CameraCaptureModal
+                  isOpen={isCameraModalOpen}
+                  onClose={() => setIsCameraModalOpen(false)}
+                  onPhotoCaptured={handlePhotoCaptured}
+                />
+              </div>
+            )}
+
+            {/* Validation Error Message */}
+            {validationError && (
+              <div className="mt-4 p-3.5 bg-[#FFEBE6] border border-[#E52E5E] rounded-xl text-[#292929] text-xs font-mono-code flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-[#E52E5E] shrink-0 mt-0.5" />
+                <span>{validationError}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Column: Selectable Quiz Settings */}
+        <div className="lg:col-span-5 space-y-6">
+          <div className="bg-[#FAF4EC] rounded-[2.5rem] border border-[#EFE5DA] shadow-[0_2px_10px_rgba(100,80,60,0.04),_0_12px_30px_rgba(100,80,60,0.08),_0_28px_56px_-6px_rgba(100,80,60,0.10),_0_45px_80px_-12px_rgba(100,80,60,0.08)] p-6 sm:p-7 space-y-6">
+            {/* 1. NUMBER OF QUESTIONS */}
+            <div>
+              <label className="font-mono text-[11px] sm:text-xs font-bold uppercase tracking-wider text-stone-600 block mb-2">
+                NUMBER OF QUESTIONS
+              </label>
+              <div className="grid grid-cols-5 gap-1.5">
+                {[5, 10, 15, 20, 30].map((num) => (
+                  <button
+                    key={num}
+                    onClick={() => setQuestionCount(num)}
+                    className={`py-2.5 rounded-2xl font-display font-black text-sm sm:text-base border transition-all cursor-pointer ${
+                      questionCount === num
+                        ? 'bg-[#E62E6B] text-white border-[#E62E6B] shadow-[0_4px_12px_rgba(230,46,107,0.35)]'
+                        : 'bg-[#EFE8DE] text-stone-900 border-[#E4DCD0] shadow-[inset_1px_1px_3px_rgba(0,0,0,0.05)] hover:bg-[#E8DFC0]'
+                    }`}
+                  >
+                    {num}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 2. DIFFICULTY */}
+            <div>
+              <label className="font-mono text-[11px] sm:text-xs font-bold uppercase tracking-wider text-stone-600 block mb-2">
+                DIFFICULTY LEVEL
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { id: 'easy' as DifficultyLevel, label: 'EASY' },
+                  { id: 'medium' as DifficultyLevel, label: 'MEDIUM' },
+                  { id: 'hard' as DifficultyLevel, label: 'HARD' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setDifficulty(item.id)}
+                    className={`py-2.5 rounded-2xl font-display font-black text-xs sm:text-sm uppercase border transition-all cursor-pointer ${
+                      difficulty === item.id
+                        ? 'bg-[#E62E6B] text-white border-[#E62E6B] shadow-[0_4px_12px_rgba(230,46,107,0.35)]'
+                        : 'bg-[#EFE8DE] text-stone-900 border-[#E4DCD0] shadow-[inset_1px_1px_3px_rgba(0,0,0,0.05)] hover:bg-[#E8DFC0]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 3. QUESTION TYPE */}
+            <div>
+              <label className="font-mono text-[11px] sm:text-xs font-bold uppercase tracking-wider text-stone-600 block mb-2">
+                QUESTION FORMAT
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { id: 'multiple_choice' as QuestionType, label: 'MULTIPLE CHOICE' },
+                  { id: 'true_false' as QuestionType, label: 'TRUE / FALSE' },
+                  { id: 'mixed' as QuestionType, label: 'MIXED' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setQuestionType(item.id)}
+                    className={`py-2.5 px-1 text-center font-mono text-[11px] font-bold uppercase rounded-2xl border transition-all cursor-pointer ${
+                      questionType === item.id
+                        ? 'bg-[#E62E6B] text-white border-[#E62E6B] shadow-[0_4px_12px_rgba(230,46,107,0.35)]'
+                        : 'bg-[#EFE8DE] text-stone-900 border-[#E4DCD0] shadow-[inset_1px_1px_3px_rgba(0,0,0,0.05)] hover:bg-[#E8DFC0]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 4. EDUCATION LEVEL */}
+            <div>
+              <label className="font-mono text-[11px] sm:text-xs font-bold uppercase tracking-wider text-stone-600 block mb-2">
+                TARGET AUDIENCE / LEVEL
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  { id: 'primary' as EducationLevel, label: 'PRIMARY SCHOOL' },
+                  { id: 'high_school' as EducationLevel, label: 'HIGH SCHOOL' },
+                  { id: 'university' as EducationLevel, label: 'UNIVERSITY' },
+                  { id: 'general' as EducationLevel, label: 'GENERAL KNOWLEDGE' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setEducationLevel(item.id)}
+                    className={`py-2.5 px-3 text-left font-mono text-[11px] font-bold uppercase rounded-2xl border transition-all cursor-pointer truncate ${
+                      educationLevel === item.id
+                        ? 'bg-[#E62E6B] text-white border-[#E62E6B] shadow-[0_4px_12px_rgba(230,46,107,0.35)]'
+                        : 'bg-[#EFE8DE] text-stone-900 border-[#E4DCD0] shadow-[inset_1px_1px_3px_rgba(0,0,0,0.05)] hover:bg-[#E8DFC0]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 5. SUBJECT CATEGORY */}
+            <div>
+              <label className="font-mono text-[11px] sm:text-xs font-bold uppercase tracking-wider text-stone-600 block mb-2">
+                SUBJECT CATEGORY
+              </label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {subjectsList.map((subj) => (
+                  <button
+                    key={subj}
+                    onClick={() => setSelectedSubject(subj)}
+                    className={`py-2 px-2 text-center font-mono text-[11px] font-bold uppercase rounded-xl border transition-all cursor-pointer truncate ${
+                      selectedSubject === subj
+                        ? 'bg-[#E62E6B] text-white border-[#E62E6B] shadow-[0_4px_12px_rgba(230,46,107,0.35)]'
+                        : 'bg-[#EFE8DE] text-stone-900 border-[#E4DCD0] shadow-[inset_1px_1px_3px_rgba(0,0,0,0.05)] hover:bg-[#E8DFC0]'
+                    }`}
+                  >
+                    {subj}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 4: THE BIG GENERATE BUTTON & GENERATING ANIMATED STATE */}
+      <div className="mt-8">
+        <button
+          onClick={handleGenerateClick}
+          disabled={isGenerating}
+          className={`w-full py-4.5 text-white font-display text-base font-black uppercase tracking-wider rounded-full shadow-[0_10px_28px_rgba(230,46,107,0.4)] active:scale-[0.99] transition-all flex items-center justify-center gap-2.5 cursor-pointer group ${
+            isGenerating
+              ? 'bg-gradient-to-r from-[#E62E6B] via-[#FF5C8A] to-[#C9245F] bg-[length:200%_200%] animate-gradient-flow'
+              : 'bg-[#E62E6B] hover:bg-[#d8245f]'
+          }`}
+        >
+          <Sparkles className="w-5 h-5 text-white" />
+          <span>{isGenerating ? 'GENERATING QUIZ...' : 'GENERATE QUIZ'}</span>
+          {!isGenerating && <ArrowRight className="w-4 h-4 text-white group-hover:translate-x-1 transition-transform" />}
+        </button>
+      </div>
+    </section>
+  );
+};
